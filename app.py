@@ -4,6 +4,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 import yfinance as yf
 
@@ -33,6 +34,37 @@ DEFAULT_SYMBOLS = {
     "Chainlink": "LINK-USD",
 }
 
+# Yahoo Finance kabhi-kabhi Streamlit Cloud par data block/rate-limit kar deta hai.
+# Isliye CoinGecko fallback add hai, taaki app phone/cloud par reliably chale.
+COINGECKO_IDS = {
+    "BTC-USD": "bitcoin",
+    "ETH-USD": "ethereum",
+    "SOL-USD": "solana",
+    "BNB-USD": "binancecoin",
+    "XRP-USD": "ripple",
+    "ADA-USD": "cardano",
+    "DOGE-USD": "dogecoin",
+    "MATIC-USD": "matic-network",
+    "LINK-USD": "chainlink",
+    "LTC-USD": "litecoin",
+}
+
+PERIOD_DAYS = {
+    "1mo": 30,
+    "3mo": 90,
+    "6mo": 180,
+    "1y": 365,
+    "2y": 730,
+    "5y": 1825,
+}
+
+RESAMPLE_RULES = {
+    "1d": "1D",
+    "1h": "1H",
+    "30m": "30min",
+    "15m": "15min",
+}
+
 
 DISCLAIMER = """
 ⚠️ **Disclaimer:** Ye app sirf educational/research purpose ke liye hai. Crypto highly volatile hota hai.
@@ -40,16 +72,18 @@ Ye financial advice nahi hai. Live trade lene se pehle apna analysis, risk manag
 """
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_market_data(symbol: str, period: str, interval: str) -> pd.DataFrame:
-    data = yf.download(
-        symbol,
-        period=period,
-        interval=interval,
-        progress=False,
-        auto_adjust=False,
-        threads=True,
-    )
+def fetch_yfinance_data(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    try:
+        data = yf.download(
+            symbol,
+            period=period,
+            interval=interval,
+            progress=False,
+            auto_adjust=False,
+            threads=True,
+        )
+    except Exception:
+        return pd.DataFrame()
 
     if data is None or data.empty:
         return pd.DataFrame()
@@ -62,6 +96,81 @@ def fetch_market_data(symbol: str, period: str, interval: str) -> pd.DataFrame:
     data = data.rename(columns={"Date": "Datetime"})
     data = data.dropna(subset=["Open", "High", "Low", "Close"])
     return data
+
+
+def fetch_coingecko_data(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    coin_id = COINGECKO_IDS.get(symbol.upper())
+    if not coin_id:
+        return pd.DataFrame()
+
+    days = PERIOD_DAYS.get(period, 180)
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
+
+    try:
+        response = requests.get(
+            url,
+            params={"vs_currency": "usd", "days": days},
+            timeout=20,
+            headers={"accept": "application/json", "user-agent": "crypto-research-agent"},
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception:
+        return pd.DataFrame()
+
+    prices = payload.get("prices", [])
+    volumes = payload.get("total_volumes", [])
+    if not prices:
+        return pd.DataFrame()
+
+    price_df = pd.DataFrame(prices, columns=["timestamp", "Close"])
+    price_df["Datetime"] = pd.to_datetime(price_df["timestamp"], unit="ms", utc=True).dt.tz_convert(None)
+    price_df = price_df[["Datetime", "Close"]].sort_values("Datetime")
+
+    if volumes:
+        volume_df = pd.DataFrame(volumes, columns=["timestamp", "Volume"])
+        volume_df["Datetime"] = pd.to_datetime(volume_df["timestamp"], unit="ms", utc=True).dt.tz_convert(None)
+        volume_df = volume_df[["Datetime", "Volume"]].sort_values("Datetime")
+        price_df = pd.merge_asof(price_df, volume_df, on="Datetime")
+    else:
+        price_df["Volume"] = 0
+
+    price_df = price_df.dropna(subset=["Close"])
+
+    # CoinGecko returns hourly data for shorter periods and daily data for longer periods.
+    # We convert price series into OHLC candles. For daily-only data, Open is previous close.
+    if len(price_df) > days + 10:
+        rule = RESAMPLE_RULES.get(interval, "1D")
+        ohlc = price_df.set_index("Datetime").resample(rule).agg(
+            Open=("Close", "first"),
+            High=("Close", "max"),
+            Low=("Close", "min"),
+            Close=("Close", "last"),
+            Volume=("Volume", "sum"),
+        )
+        data = ohlc.dropna().reset_index()
+    else:
+        data = price_df.copy()
+        data["Open"] = data["Close"].shift(1).fillna(data["Close"])
+        data["High"] = data[["Open", "Close"]].max(axis=1)
+        data["Low"] = data[["Open", "Close"]].min(axis=1)
+        data = data[["Datetime", "Open", "High", "Low", "Close", "Volume"]]
+
+    return data.dropna(subset=["Open", "High", "Low", "Close"])
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_market_data(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    # First try Yahoo Finance. If it fails/returns too little data, fallback to CoinGecko.
+    data = fetch_yfinance_data(symbol, period, interval)
+    if data is not None and not data.empty and len(data) >= 25:
+        return data
+
+    fallback = fetch_coingecko_data(symbol, period, interval)
+    if fallback is not None and not fallback.empty:
+        return fallback
+
+    return data if data is not None else pd.DataFrame()
 
 
 def calculate_rsi(close: pd.Series, window: int = 14) -> pd.Series:
@@ -444,8 +553,9 @@ if interval in ["15m", "30m", "1h"] and period in ["2y", "5y"]:
 with st.spinner(f"Fetching {symbol} data..."):
     raw_df = fetch_market_data(symbol, period, interval)
 
-if raw_df.empty or len(raw_df) < 60:
+if raw_df.empty or len(raw_df) < 25:
     st.error("Data nahi mila ya insufficient data hai. Symbol/period/interval change karke try karein.")
+    st.info("Tip: Default coins jaise Bitcoin/Ethereum select karke Period 6mo ya 1y aur Interval 1d try karein.")
     st.stop()
 
 df = add_indicators(raw_df).dropna().reset_index(drop=True)
